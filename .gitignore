@@ -127,3 +127,10 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# AI 音乐生成产物
+out_pytorch.midi
+out.midi
+model/*.pth
+model/*.pt
+*.ckpt
