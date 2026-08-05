@@ -1,6 +1,6 @@
-# Transformer-enhanced PyTorch AI music example
-# Added sampling controls: temperature, top-k, top-p for pitch sampling.
-# Model supports transformer or LSTM; generation uses sampling controls to trade off diversity.
+# Autoregressive Transformer PyTorch AI music example
+# Upgrade: Transformer changed to autoregressive decoder-style (causal mask) for generation-quality improvement.
+# Training now predicts next note at each time step (teacher forcing) using causal masking.
 
 import os
 import math
@@ -41,11 +41,21 @@ def read_midi_notes() -> List[List[float]]:
     return midi_inputs
 
 
-class MidiSequenceDataset(Dataset):
+class ARMidiSequenceDataset(Dataset):
+    """Autoregressive dataset: for each sliding window of length seq_length+1,
+    inputs = first seq_length items, targets = next seq_length items (shifted by 1).
+    Returns:
+      pitch_inputs: (seq_len,)
+      cont_inputs: (seq_len, 2)
+      pitch_targets: (seq_len,)
+      step_targets: (seq_len,)
+      duration_targets: (seq_len,)
+    """
+
     def __init__(self, midi_inputs: List[List[float]], normalize: bool = True):
         super().__init__()
         self.midi_inputs = midi_inputs
-        self.cut_seq_length = seq_length + 1
+        self.window = seq_length + 1
         self.sequences = self._make_sequences()
         self.normalize = normalize
         steps = [item[1] for item in midi_inputs]
@@ -62,8 +72,8 @@ class MidiSequenceDataset(Dataset):
     def _make_sequences(self):
         seqs = []
         n = len(self.midi_inputs)
-        for i in range(0, n - self.cut_seq_length + 1):
-            window = self.midi_inputs[i:i + self.cut_seq_length]
+        for i in range(0, n - self.window + 1):
+            window = self.midi_inputs[i:i + self.window]
             seqs.append(window)
         return seqs
 
@@ -71,23 +81,32 @@ class MidiSequenceDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        inputs = seq[:-1]
-        target = seq[-1]
-        pitch_idxs = torch.tensor([int(item[0]) for item in inputs], dtype=torch.long)
-        steps = torch.tensor([item[1] for item in inputs], dtype=torch.float32)
-        durations = torch.tensor([item[2] for item in inputs], dtype=torch.float32)
+        w = self.sequences[idx]
+        # inputs: positions 0..seq_length-1, targets: positions 1..seq_length
+        inputs = w[:-1]
+        targets = w[1:]
+        pitch_inputs = torch.tensor([int(x[0]) for x in inputs], dtype=torch.long)  # (seq,)
+        steps_in = torch.tensor([x[1] for x in inputs], dtype=torch.float32)
+        durs_in = torch.tensor([x[2] for x in inputs], dtype=torch.float32)
+        pitch_targets = torch.tensor([int(x[0]) for x in targets], dtype=torch.long)  # (seq,)
+        step_targets = torch.tensor([x[1] for x in targets], dtype=torch.float32)
+        dur_targets = torch.tensor([x[2] for x in targets], dtype=torch.float32)
+
         if self.normalize:
-            steps = (steps - self.step_mean) / self.step_std
-            durations = (durations - self.duration_mean) / self.duration_std
-        cont_inputs = torch.stack([steps, durations], dim=-1)
-        label_pitch = torch.tensor(int(target[0]), dtype=torch.long)
-        label_step = torch.tensor(float(target[1]), dtype=torch.float32)
-        label_duration = torch.tensor(float(target[2]), dtype=torch.float32)
-        return (pitch_idxs, cont_inputs), {'pitch': label_pitch, 'step': label_step, 'duration': label_duration}
+            steps_in = (steps_in - self.step_mean) / self.step_std
+            durs_in = (durs_in - self.duration_mean) / self.duration_std
+            step_targets_norm = (step_targets - self.step_mean) / self.step_std
+            dur_targets_norm = (dur_targets - self.duration_mean) / self.duration_std
+        else:
+            step_targets_norm = step_targets
+            dur_targets_norm = dur_targets
+
+        cont_inputs = torch.stack([steps_in, durs_in], dim=-1)  # (seq, 2)
+
+        return (pitch_inputs, cont_inputs), {'pitch': pitch_targets, 'step': step_targets_norm, 'duration': dur_targets_norm}
 
 
-# ---------------- Model components ----------------
+# ---------------- Model: Autoregressive Transformer ----------------
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
@@ -104,13 +123,21 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :seq_len]
 
 
-class TransformerMusicModel(nn.Module):
+def generate_causal_mask(sz: int, device: Optional[torch.device] = None) -> torch.Tensor:
+    # mask with float('-inf') for positions that should be masked
+    mask = torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
+    if device is not None:
+        mask = mask.to(device)
+    return mask
+
+
+class AutoregressiveTransformer(nn.Module):
     def __init__(self,
                  vocab_size: int = 128,
                  embed_dim: int = 64,
-                 nhead: int = 8,
                  d_model: int = 128,
-                 num_encoder_layers: int = 4,
+                 nhead: int = 8,
+                 num_layers: int = 4,
                  dim_feedforward: int = 256,
                  dropout: float = 0.1,
                  cont_dim: int = 2):
@@ -118,39 +145,41 @@ class TransformerMusicModel(nn.Module):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.pitch_embed = nn.Embedding(vocab_size, embed_dim)
-        # project continuous features to d_model-sized vectors
         self.cont_proj = nn.Linear(cont_dim, d_model - embed_dim)
-        self.input_proj = nn.Linear(d_model, d_model)  # optional projection
+        self.input_proj = nn.Linear(d_model, d_model)
         self.pos_enc = PositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.layernorm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        # Shared joint representation to predict both pitch and duration/step
         self.joint_proj = nn.Linear(d_model, d_model)
-        # Multi-head outputs: pitch classification + step & duration regression heads
+        # per-position outputs
         self.pitch_head = nn.Linear(d_model, vocab_size)
         self.step_head = nn.Linear(d_model, 1)
         self.duration_head = nn.Linear(d_model, 1)
 
     def forward(self, pitch_idxs: torch.Tensor, cont_inputs: torch.Tensor):
+        # pitch_idxs: (B, seq), cont_inputs: (B, seq, cont_dim)
         emb = self.pitch_embed(pitch_idxs)  # (B, seq, embed_dim)
-        cont = self.cont_proj(cont_inputs)  # (B, seq, d_model - embed_dim)
+        cont = self.cont_proj(cont_inputs)  # (B, seq, d_model-embed)
         x = torch.cat([emb, cont], dim=-1)  # (B, seq, d_model)
         x = self.input_proj(x)
         x = self.pos_enc(x)
-        x = self.transformer(x)  # (B, seq, d_model)
-        last = x[:, -1, :]
-        last = self.layernorm(last)
-        last = self.dropout(last)
-        joint = torch.relu(self.joint_proj(last))
-        pitch_logits = self.pitch_head(joint)
-        step = self.step_head(joint).squeeze(-1)
-        duration = self.duration_head(joint).squeeze(-1)
-        return {'pitch': pitch_logits, 'step': step, 'duration': duration}
+        # create causal mask
+        seq_len = x.size(1)
+        device = x.device
+        mask = generate_causal_mask(seq_len, device=device)
+        x = self.transformer(x, mask=mask)
+        x = self.layernorm(x)
+        x = self.dropout(x)
+        joint = torch.relu(self.joint_proj(x))  # (B, seq, d_model)
+        pitch_logits = self.pitch_head(joint)  # (B, seq, vocab)
+        step_preds = self.step_head(joint).squeeze(-1)  # (B, seq)
+        dur_preds = self.duration_head(joint).squeeze(-1)  # (B, seq)
+        return {'pitch': pitch_logits, 'step': step_preds, 'duration': dur_preds}
 
 
-# Keep the previous LSTM model as fallback
+# keep LSTM as before (single next prediction)
 class MusicLSTMImproved(nn.Module):
     def __init__(self,
                  vocab_size: int = 128,
@@ -202,6 +231,7 @@ class MSEWithPositivePressure(nn.Module):
         self.std = std
 
     def forward(self, y_pred_norm: torch.Tensor, y_true: torch.Tensor):
+        # y_pred_norm and y_true can be shape (B, seq)
         y_true_norm = (y_true - self.mean) / self.std
         mse_loss = self.mse(y_pred_norm, y_true_norm)
         y_pred_denorm = y_pred_norm * self.std + self.mean
@@ -212,7 +242,6 @@ class MSEWithPositivePressure(nn.Module):
 
 # ---------------- Sampling helpers ----------------
 def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0) -> torch.Tensor:
-    # logits: 1D tensor
     top_k = int(top_k)
     if top_k > 0:
         values, indices = torch.topk(logits, top_k)
@@ -224,26 +253,20 @@ def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 0
         sorted_logits, sorted_indices = torch.sort(filtered_logits, descending=True)
         probs = torch.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(probs, dim=-1)
-        # remove tokens with cumulative prob above top_p
         cutoff = cumulative_probs > top_p
-        # Keep at least one token
         if cutoff[0]:
             cutoff[0] = False
-        # set logits beyond cutoff to -inf
         sorted_logits[cutoff] = float('-inf')
-        # scatter back to original ordering
         filtered_logits = torch.full_like(filtered_logits, float('-inf'))
         filtered_logits[sorted_indices] = sorted_logits
     return filtered_logits
 
 
 def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0) -> int:
-    # logits: 1D tensor
     if temperature <= 0:
         raise ValueError('Temperature must be > 0')
     logits = logits / float(temperature)
     filtered_logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
-    # convert -inf to large negative for numerical stability before softmax if all -inf then fallback
     if torch.isinf(filtered_logits).all():
         filtered_logits = logits
     dist = torch.distributions.Categorical(logits=filtered_logits)
@@ -255,13 +278,14 @@ def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_k: in
 
 def build_model(model_type: str = 'transformer', **kwargs) -> nn.Module:
     if model_type == 'transformer':
-        return TransformerMusicModel(vocab_size=vocab_size,
-                                     embed_dim=kwargs.get('embed_dim', 64),
-                                     nhead=kwargs.get('nhead', 8),
-                                     d_model=kwargs.get('d_model', 128),
-                                     num_encoder_layers=kwargs.get('num_layers', 4),
-                                     dim_feedforward=kwargs.get('dim_feedforward', 256),
-                                     dropout=kwargs.get('dropout', 0.1))
+        # Autoregressive transformer
+        return AutoregressiveTransformer(vocab_size=vocab_size,
+                                          embed_dim=kwargs.get('embed_dim', 64),
+                                          d_model=kwargs.get('d_model', 128),
+                                          nhead=kwargs.get('nhead', 8),
+                                          num_layers=kwargs.get('num_layers', 4),
+                                          dim_feedforward=kwargs.get('dim_feedforward', 256),
+                                          dropout=kwargs.get('dropout', 0.1))
     else:
         return MusicLSTMImproved(vocab_size=vocab_size,
                                  embed_dim=kwargs.get('embed_dim', 32),
@@ -281,13 +305,51 @@ def train(epochs: int = 50,
     if len(midi_inputs) < seq_length + 1:
         print('Not enough notes to train.')
         return
-    dataset = MidiSequenceDataset(midi_inputs, normalize=True)
+
+    # autoregressive transformer uses AR dataset; LSTM uses previous single-step dataset
+    if model_type == 'transformer':
+        dataset = ARMidiSequenceDataset(midi_inputs, normalize=True)
+    else:
+        # the older dataset: inputs length seq_length, single-step target
+        dataset = MidiSequenceDataset = None
+        # reuse previous simple dataset behavior by constructing windows and returning single target as before
+        # to keep code minimal, construct AR-like dataset but only use last target per window
+        dataset_all = ARMidiSequenceDataset(midi_inputs, normalize=True)
+        # wrap to provide last-target only
+        class SingleTargetWrapper(Dataset):
+            def __init__(self, ar_ds):
+                self.ar_ds = ar_ds
+            def __len__(self):
+                return len(self.ar_ds)
+            def __getitem__(self, idx):
+                (pitch_inputs, cont_inputs), targets = self.ar_ds[idx]
+                # return inputs and only the last position targets
+                pitch_target_last = targets['pitch'][-1]
+                step_target_last = targets['step'][-1]
+                dur_target_last = targets['duration'][-1]
+                return (pitch_inputs, cont_inputs), {'pitch': pitch_target_last, 'step': step_target_last, 'duration': dur_target_last}
+        dataset = SingleTargetWrapper(dataset_all)
+
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
     model = build_model(model_type=model_type, **model_kwargs).to(device)
+
     ce_loss = nn.CrossEntropyLoss()
-    step_loss_fn = MSEWithPositivePressure(pressure=10.0, mean=dataset.step_mean, std=dataset.step_std)
-    duration_loss_fn = MSEWithPositivePressure(pressure=10.0, mean=dataset.duration_mean, std=dataset.duration_std)
+    # dataset stats for loss (we can take from dataset object)
+    if model_type == 'transformer':
+        step_mean = dataset.step_mean
+        step_std = dataset.step_std
+        duration_mean = dataset.duration_mean
+        duration_std = dataset.duration_std
+    else:
+        # dataset_all defined above
+        step_mean = dataset_all.step_mean
+        step_std = dataset_all.step_std
+        duration_mean = dataset_all.duration_mean
+        duration_std = dataset_all.duration_std
+
+    step_loss_fn = MSEWithPositivePressure(pressure=10.0, mean=step_mean, std=step_std)
+    duration_loss_fn = MSEWithPositivePressure(pressure=10.0, mean=duration_mean, std=duration_std)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=3, verbose=True)
@@ -299,21 +361,29 @@ def train(epochs: int = 50,
         model.train()
         running_loss = 0.0
         n_batches = 0
-        for (pitch_idxs, cont_inputs), batch_labels in loader:
-            pitch_idxs = pitch_idxs.to(device)
+        for (pitch_inputs, cont_inputs), batch_labels in loader:
+            pitch_inputs = pitch_inputs.to(device)
             cont_inputs = cont_inputs.to(device)
+            # labels may be sequence (B, seq) or scalar depending on dataset wrapper
             pitch_labels = batch_labels['pitch'].to(device)
             step_labels = batch_labels['step'].to(device)
             duration_labels = batch_labels['duration'].to(device)
 
-            outputs = model(pitch_idxs, cont_inputs)
+            outputs = model(pitch_inputs, cont_inputs)
+            # outputs for transformer: per-position (B, seq, ...); for LSTM: single-position
             pitch_logits = outputs['pitch']
-            step_preds_norm = outputs['step']
-            duration_preds_norm = outputs['duration']
+            step_preds = outputs['step']
+            dur_preds = outputs['duration']
 
-            loss_pitch = ce_loss(pitch_logits, pitch_labels)
-            loss_step = step_loss_fn(step_preds_norm, step_labels)
-            loss_duration = duration_loss_fn(duration_preds_norm, duration_labels)
+            if pitch_logits.dim() == 3:
+                B, S, C = pitch_logits.shape
+                loss_pitch = ce_loss(pitch_logits.view(B * S, C), pitch_labels.view(B * S))
+                loss_step = step_loss_fn(step_preds, step_labels)
+                loss_duration = duration_loss_fn(dur_preds, duration_labels)
+            else:
+                loss_pitch = ce_loss(pitch_logits, pitch_labels)
+                loss_step = step_loss_fn(step_preds, step_labels)
+                loss_duration = duration_loss_fn(dur_preds, duration_labels)
 
             loss = 0.05 * loss_pitch + 1.0 * loss_step + 1.0 * loss_duration
 
@@ -337,10 +407,10 @@ def train(epochs: int = 50,
                 'epoch': epoch,
                 'loss': epoch_loss,
                 'dataset_stats': {
-                    'step_mean': dataset.step_mean,
-                    'step_std': dataset.step_std,
-                    'duration_mean': dataset.duration_mean,
-                    'duration_std': dataset.duration_std,
+                    'step_mean': step_mean,
+                    'step_std': step_std,
+                    'duration_mean': duration_mean,
+                    'duration_std': duration_std,
                 },
                 'model_meta': {
                     'model_type': model_type,
@@ -352,7 +422,7 @@ def train(epochs: int = 50,
     print('Training finished.')
 
 
-# ---------------- Prediction ----------------
+# ---------------- Prediction (autoregressive) ----------------
 
 def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model_type: str = 'transformer', temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0, **model_kwargs):
     device = torch.device(device) if device else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
@@ -362,15 +432,13 @@ def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model
         ckpt = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
         stats = ckpt.get('dataset_stats', None)
-        meta = ckpt.get('model_meta', None)
         if stats:
             step_mean = stats['step_mean']
             step_std = stats['step_std']
             duration_mean = stats['duration_mean']
             duration_std = stats['duration_std']
         else:
-            midi_inputs = read_midi_notes()
-            tmp = MidiSequenceDataset(midi_inputs, normalize=True)
+            tmp = ARMidiSequenceDataset(read_midi_notes(), normalize=True)
             step_mean = tmp.step_mean
             step_std = tmp.step_std
             duration_mean = tmp.duration_mean
@@ -378,8 +446,7 @@ def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model
         print('Loaded checkpoint:', checkpoint_path)
     else:
         print('No checkpoint found, running with randomly initialized model.')
-        midi_inputs = read_midi_notes()
-        tmp = MidiSequenceDataset(midi_inputs, normalize=True)
+        tmp = ARMidiSequenceDataset(read_midi_notes(), normalize=True)
         step_mean = tmp.step_mean
         step_std = tmp.step_std
         duration_mean = tmp.duration_mean
@@ -391,31 +458,33 @@ def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model
         print('Not enough notes to predict.')
         return
 
-    sample_notes = random.sample(midi_inputs, seq_length)
-    generated = list(sample_notes)
+    # seed with seq_length notes
+    generated = random.sample(midi_inputs, seq_length)
 
     for i in range(num_predictions):
-        n_notes = generated[-seq_length:]
-        pitch_idxs = torch.tensor([[int(item[0]) for item in n_notes]], dtype=torch.long).to(device)
-        steps = torch.tensor([[item[1] for item in n_notes]], dtype=torch.float32)
-        durations = torch.tensor([[item[2] for item in n_notes]], dtype=torch.float32)
+        # build input from last seq_length notes
+        context = generated[-seq_length:]
+        pitch_input = torch.tensor([[int(x[0]) for x in context]], dtype=torch.long).to(device)  # (1, seq)
+        steps = torch.tensor([[x[1] for x in context]], dtype=torch.float32).to(device)
+        durs = torch.tensor([[x[2] for x in context]], dtype=torch.float32).to(device)
         steps_norm = (steps - step_mean) / step_std
-        durations_norm = (durations - duration_mean) / duration_std
-        cont_in = torch.stack([steps_norm.squeeze(0), durations_norm.squeeze(0)], dim=-1).unsqueeze(0).to(device)
+        durs_norm = (durs - duration_mean) / duration_std
+        cont_in = torch.stack([steps_norm.squeeze(0), durs_norm.squeeze(0)], dim=-1).unsqueeze(0).to(device)  # (1, seq, 2)
 
         with torch.no_grad():
-            outputs = model(pitch_idxs, cont_in)
-            pitch_logits = outputs['pitch'][0]
-            # sample pitch using temperature / top-k / top-p
+            outputs = model(pitch_input, cont_in)
+            # outputs are per-position; take last position
+            pitch_logits = outputs['pitch'][0, -1]
             pitch = sample_from_logits(pitch_logits, temperature=temperature, top_k=top_k, top_p=top_p)
-            step_pred_norm = outputs['step'][0].item()
-            dur_pred_norm = outputs['duration'][0].item()
+            step_pred_norm = outputs['step'][0, -1].item()
+            dur_pred_norm = outputs['duration'][0, -1].item()
             step = step_pred_norm * step_std + step_mean
             duration = dur_pred_norm * duration_std + duration_mean
             step = max(0.0, float(step))
             duration = max(0.01, float(duration))
         generated.append([pitch, step, duration])
 
+    # reconstruct midi
     prev_start = 0.0
     midi_notes = []
     for m in generated:
@@ -440,7 +509,7 @@ def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Transformer-enhanced PyTorch AI music example with sampling controls')
+    parser = argparse.ArgumentParser(description='Autoregressive Transformer PyTorch AI music example')
     parser.add_argument('--train', action='store_true', help='Run training')
     parser.add_argument('--predict', action='store_true', help='Run prediction (generate MIDI)')
     parser.add_argument('--epochs', type=int, default=50)
