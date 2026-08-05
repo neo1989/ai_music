@@ -1,10 +1,6 @@
-# Transformer-based PyTorch version of midi_main.py
-# Upgrades:
-# - Pitch embedding + positional encoding
-# - Transformer encoder stack (multi-head self-attention)
-# - Joint pitch-duration modeling with shared representation and separate heads (multi-head outputs)
-# - CLI to choose model type (transformer or lstm)
-# - Keeps normalization, checkpointing, and generation logic
+# Transformer-enhanced PyTorch AI music example
+# Added sampling controls: temperature, top-k, top-p for pitch sampling.
+# Model supports transformer or LSTM; generation uses sampling controls to trade off diversity.
 
 import os
 import math
@@ -104,7 +100,6 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len, d_model)
         seq_len = x.size(1)
         return x + self.pe[:, :seq_len]
 
@@ -139,7 +134,6 @@ class TransformerMusicModel(nn.Module):
         self.duration_head = nn.Linear(d_model, 1)
 
     def forward(self, pitch_idxs: torch.Tensor, cont_inputs: torch.Tensor):
-        # pitch_idxs: (B, seq), cont_inputs: (B, seq, 2)
         emb = self.pitch_embed(pitch_idxs)  # (B, seq, embed_dim)
         cont = self.cont_proj(cont_inputs)  # (B, seq, d_model - embed_dim)
         x = torch.cat([emb, cont], dim=-1)  # (B, seq, d_model)
@@ -214,6 +208,47 @@ class MSEWithPositivePressure(nn.Module):
         negative_part = torch.relu(-y_pred_denorm)
         positive_pressure = self.pressure * torch.mean(negative_part)
         return mse_loss + positive_pressure
+
+
+# ---------------- Sampling helpers ----------------
+def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0) -> torch.Tensor:
+    # logits: 1D tensor
+    top_k = int(top_k)
+    if top_k > 0:
+        values, indices = torch.topk(logits, top_k)
+        min_values = values[-1]
+        filtered_logits = torch.where(logits < min_values, torch.tensor(float('-inf'), device=logits.device), logits)
+    else:
+        filtered_logits = logits
+    if top_p > 0.0 and top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(filtered_logits, descending=True)
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(probs, dim=-1)
+        # remove tokens with cumulative prob above top_p
+        cutoff = cumulative_probs > top_p
+        # Keep at least one token
+        if cutoff[0]:
+            cutoff[0] = False
+        # set logits beyond cutoff to -inf
+        sorted_logits[cutoff] = float('-inf')
+        # scatter back to original ordering
+        filtered_logits = torch.full_like(filtered_logits, float('-inf'))
+        filtered_logits[sorted_indices] = sorted_logits
+    return filtered_logits
+
+
+def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0) -> int:
+    # logits: 1D tensor
+    if temperature <= 0:
+        raise ValueError('Temperature must be > 0')
+    logits = logits / float(temperature)
+    filtered_logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+    # convert -inf to large negative for numerical stability before softmax if all -inf then fallback
+    if torch.isinf(filtered_logits).all():
+        filtered_logits = logits
+    dist = torch.distributions.Categorical(logits=filtered_logits)
+    sample = dist.sample().item()
+    return int(sample)
 
 
 # ---------------- Training & Checkpoint ----------------
@@ -319,7 +354,7 @@ def train(epochs: int = 50,
 
 # ---------------- Prediction ----------------
 
-def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model_type: str = 'transformer', **model_kwargs):
+def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model_type: str = 'transformer', temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0, **model_kwargs):
     device = torch.device(device) if device else (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
     model = build_model(model_type=model_type, **model_kwargs).to(device)
 
@@ -371,8 +406,8 @@ def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model
         with torch.no_grad():
             outputs = model(pitch_idxs, cont_in)
             pitch_logits = outputs['pitch'][0]
-            pitch_dist = torch.distributions.Categorical(logits=pitch_logits)
-            pitch = int(pitch_dist.sample().item())
+            # sample pitch using temperature / top-k / top-p
+            pitch = sample_from_logits(pitch_logits, temperature=temperature, top_k=top_k, top_p=top_p)
             step_pred_norm = outputs['step'][0].item()
             dur_pred_norm = outputs['duration'][0].item()
             step = step_pred_norm * step_std + step_mean
@@ -405,7 +440,7 @@ def predict_midi(num_predictions: int = 600, device: Optional[str] = None, model
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Transformer-enhanced PyTorch AI music example')
+    parser = argparse.ArgumentParser(description='Transformer-enhanced PyTorch AI music example with sampling controls')
     parser.add_argument('--train', action='store_true', help='Run training')
     parser.add_argument('--predict', action='store_true', help='Run prediction (generate MIDI)')
     parser.add_argument('--epochs', type=int, default=50)
@@ -425,6 +460,10 @@ if __name__ == '__main__':
     parser.add_argument('--hidden-size', type=int, default=256)
     parser.add_argument('--lstm-num-layers', type=int, default=2)
     parser.add_argument('--device', type=str, default='', help='torch device string, e.g. cpu or cuda:0')
+    # sampling controls
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (>0).')
+    parser.add_argument('--top-k', type=int, default=0, help='Top-k sampling (0 to disable)')
+    parser.add_argument('--top-p', type=float, default=0.0, help='Top-p (nucleus) sampling (0.0 to disable)')
 
     args = parser.parse_args()
 
@@ -446,7 +485,7 @@ if __name__ == '__main__':
                                 dim_feedforward=args.dim_feedforward, dropout=args.dropout)
         else:
             model_kwargs = dict(embed_dim=args.lstm_embed_dim, use_embedding=True, hidden_size=args.hidden_size, num_layers=args.lstm_num_layers)
-        predict_midi(num_predictions=args.num_predictions, device=args.device or None, model_type=model_type, **model_kwargs)
+        predict_midi(num_predictions=args.num_predictions, device=args.device or None, model_type=model_type, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, **model_kwargs)
 
     if (not args.train) and (not args.predict):
         # default: run prediction
