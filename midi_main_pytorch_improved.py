@@ -88,9 +88,9 @@ def read_midi_notes(rhythm_grid: int = 16) -> Tuple[List[List[float]], RhythmAna
             prev_start = note.start
             
             # 计算节奏特征
-            beat_pos = rhythm_analyzer.extract_beat_position(note.start, rhythm_grid)
-            quantized_step = rhythm_analyzer.quantize_to_beat(step, rhythm_grid)
-            beat_strength = rhythm_analyzer.extract_beat_strength(quantized_step, rhythm_grid)
+            beat_pos = rhythm_analyzer.extract_beat_position(note.start, grid=rhythm_grid)
+            quantized_step = rhythm_analyzer.quantize_to_beat(step, grid=rhythm_grid)
+            beat_strength = rhythm_analyzer.extract_beat_strength(quantized_step, grid=rhythm_grid)
             
             midi_inputs.append([
                 float(note.pitch),        # 0: pitch
@@ -738,10 +738,10 @@ def predict_midi(num_predictions: int = 600, device: Optional[str] = None,
             step = max(0.0, step)
             duration = max(0.01, duration)
             
-            # Compute new rhythm features
-            beat_pos = rhythm_analyzer.extract_beat_position(step, rhythm_grid=16)
+            # Compute new rhythm features (fix: use grid parameter name, not rhythm_grid)
+            beat_pos = rhythm_analyzer.extract_beat_position(step, grid=16)
             beat_strength = rhythm_analyzer.extract_beat_strength(
-                rhythm_analyzer.quantize_to_beat(step, 16), 16
+                rhythm_analyzer.quantize_to_beat(step, grid=16), grid=16
             )
             
             generated.append([pitch, step, duration, beat_pos, beat_strength])
