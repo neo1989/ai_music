@@ -8,6 +8,7 @@ import os
 import math
 import random
 from typing import List, Optional, Tuple, Dict
+from collections import Counter
 
 import pretty_midi
 import torch
@@ -29,8 +30,134 @@ class RhythmAnalyzer:
         self.beat_duration = 60.0 / tempo  # 一个beat的时长
     
     def analyze_time_signature(self, notes: List) -> Tuple[int, int]:
-        """简单推断拍号 (假设4/4)"""
-        return (4, 4)
+        """
+        根据音符特征推断拍号
+        支持常见拍号: 2/4, 3/4, 4/4, 6/8
+        
+        Args:
+            notes: pretty_midi Note对象列表，或包含start/end时间的对象
+            
+        Returns:
+            (numerator, denominator) 拍号元组，如 (4, 4)
+        """
+        if not notes or len(notes) < 2:
+            return (4, 4)  # 默认返回4/4
+        
+        try:
+            # 提取音符的start时间
+            start_times = []
+            for note in notes:
+                if hasattr(note, 'start'):
+                    start_times.append(note.start)
+                elif isinstance(note, (list, tuple)) and len(note) > 0:
+                    start_times.append(note[0])
+                else:
+                    return (4, 4)
+            
+            if len(start_times) < 2:
+                return (4, 4)
+            
+            start_times = sorted(start_times)
+            
+            # 计算相邻音符的时间间隔
+            intervals = []
+            for i in range(1, len(start_times)):
+                interval = start_times[i] - start_times[i-1]
+                if interval > 1e-6:  # 忽略极小的间隔
+                    intervals.append(interval)
+            
+            if not intervals:
+                return (4, 4)
+            
+            # 使用GCD (最大公约数) 找出基础节拍单位
+            def gcd_list(lst):
+                """计算列表中所有数的最大公约数"""
+                from math import gcd
+                result = lst[0]
+                for val in lst[1:]:
+                    # 将浮点数转换为整数比例
+                    result = gcd(int(round(result * 1000)), int(round(val * 1000)))
+                return result / 1000
+            
+            base_unit = gcd_list(intervals)
+            if base_unit < 1e-6:
+                base_unit = min(intervals)
+            
+            # 将每个interval标准化为base_unit的倍数
+            beat_counts = []
+            for interval in intervals:
+                count = round(interval / base_unit)
+                if count > 0:
+                    beat_counts.append(count)
+            
+            if not beat_counts:
+                return (4, 4)
+            
+            # 统计beat pattern分布
+            beat_pattern = Counter(beat_counts)
+            most_common_beat = beat_pattern.most_common(1)[0][0]
+            
+            # 根据主要beat pattern推断拍号
+            # 在4/4拍中，通常有4个quarter beats
+            # 在3/4拍中，通常有3个quarter beats
+            # 在6/8拍中，通常有6个eighth beats (显示为3个dotted quarter beats)
+            
+            # 计算beat pattern的分布特征
+            pattern_values = sorted(beat_pattern.items(), key=lambda x: x[1], reverse=True)
+            
+            # 启发式规则来推断拍号
+            if most_common_beat == 1:
+                # 大多数音符均匀分布，可能是更细致的grid
+                numerator = 4
+                denominator = 4
+            elif most_common_beat == 2:
+                # 大多数跨度是base_unit的2倍
+                numerator = 2
+                denominator = 4
+            elif most_common_beat == 3:
+                # 大多数跨度是base_unit的3倍
+                numerator = 3
+                denominator = 4
+            elif most_common_beat == 4:
+                # 大多数跨度是base_unit的4倍
+                numerator = 4
+                denominator = 4
+            elif most_common_beat == 6:
+                # 6个beat可能是6/8或2/4的变体
+                numerator = 6
+                denominator = 8
+            elif most_common_beat >= 5:
+                # 5个以上beat通常回退到4/4
+                numerator = 4
+                denominator = 4
+            else:
+                numerator = 4
+                denominator = 4
+            
+            # 验证推断结果的合理性
+            # 检查是否有显著的多模式pattern
+            if len(pattern_values) > 1:
+                # 如果有多个主要beat pattern，检查它们的比例
+                primary_count = pattern_values[0][1]
+                secondary_count = pattern_values[1][1]
+                
+                # 如果secondary pattern占比超过30%，可能需要调整推断
+                if secondary_count / primary_count > 0.3:
+                    # 尝试检测复合拍号
+                    if (pattern_values[0][0] == 2 and pattern_values[1][0] == 3) or \
+                       (pattern_values[0][0] == 3 and pattern_values[1][0] == 2):
+                        # 可能是变化的3/4或2/4
+                        if pattern_values[0][0] > pattern_values[1][0]:
+                            numerator = pattern_values[0][0]
+                        else:
+                            numerator = pattern_values[1][0]
+            
+            return (numerator, denominator)
+        
+        except Exception as e:
+            # 如果分析过程出错，返回默认值
+            print(f"Warning: Error analyzing time signature: {e}")
+            return (4, 4)
     
     def quantize_to_beat(self, time_val: float, grid: int = 16) -> int:
         """量化到最近的beat grid (1/grid beat)"""
